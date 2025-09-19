@@ -805,6 +805,293 @@ class PlatformAgent(SimuNetAgent):
         """Get feed for a specific user.
         
         Args:
+            user_id: User ID to get feed for
+            limit: Maximum number of items to return
+            
+        Returns:
+            List of (content_id, score) tuples
+        """
+        user_feed = self.user_feeds.get(user_id, [])
+        return user_feed[:limit]
+    
+    async def get_trending_content(self, limit: int = 20) -> List[str]:
+        """Get current trending content.
+        
+        Args:
+            limit: Maximum number of items to return
+            
+        Returns:
+            List of trending content IDs
+        """
+        return self.trending_content[:limit]
+    
+    async def get_viral_content(self, limit: int = 20) -> List[str]:
+        """Get current viral content.
+        
+        Args:
+            limit: Maximum number of items to return
+            
+        Returns:
+            List of viral content IDs
+        """
+        return self.viral_content[:limit]
+    
+    async def create_experiment(
+        self,
+        name: str,
+        description: str,
+        control_config: Dict[str, Any],
+        treatment_config: Dict[str, Any],
+        traffic_split: float = 0.5,
+        duration_hours: int = 168
+    ) -> str:
+        """Create a new A/B experiment.
+        
+        Args:
+            name: Experiment name
+            description: Experiment description
+            control_config: Configuration for control group
+            treatment_config: Configuration for treatment group
+            traffic_split: Fraction of users in treatment group
+            duration_hours: Experiment duration in hours
+            
+        Returns:
+            Experiment ID
+        """
+        experiment_id = str(uuid.uuid4())
+        
+        experiment = ABTestExperiment(
+            experiment_id=experiment_id,
+            name=name,
+            description=description,
+            control_config=control_config,
+            treatment_config=treatment_config,
+            traffic_split=traffic_split,
+            duration_hours=duration_hours
+        )
+        
+        self.active_experiments[experiment_id] = experiment
+        
+        self.logger.info("Experiment created", experiment_id=experiment_id, name=name)
+        
+        return experiment_id
+    
+    async def start_experiment(self, experiment_id: str) -> bool:
+        """Start an A/B experiment.
+        
+        Args:
+            experiment_id: Experiment ID to start
+            
+        Returns:
+            True if started successfully
+        """
+        experiment = self.active_experiments.get(experiment_id)
+        if not experiment:
+            self.logger.error("Experiment not found", experiment_id=experiment_id)
+            return False
+        
+        if experiment.status != ExperimentStatus.DRAFT:
+            self.logger.error("Experiment not in draft status", experiment_id=experiment_id)
+            return False
+        
+        experiment.status = ExperimentStatus.RUNNING
+        experiment.start_time = datetime.utcnow()
+        experiment.end_time = experiment.start_time + timedelta(hours=experiment.duration_hours)
+        
+        # Publish experiment start event
+        await self.publish_event(
+            event_type="experiment_started",
+            payload={
+                "experiment_id": experiment_id,
+                "name": experiment.name,
+                "start_time": experiment.start_time.isoformat(),
+                "end_time": experiment.end_time.isoformat(),
+                "traffic_split": experiment.traffic_split
+            }
+        )
+        
+        self.logger.info("Experiment started", experiment_id=experiment_id)
+        
+        return True
+    
+    async def stop_experiment(self, experiment_id: str) -> bool:
+        """Stop an A/B experiment early.
+        
+        Args:
+            experiment_id: Experiment ID to stop
+            
+        Returns:
+            True if stopped successfully
+        """
+        experiment = self.active_experiments.get(experiment_id)
+        if not experiment:
+            self.logger.error("Experiment not found", experiment_id=experiment_id)
+            return False
+        
+        if experiment.status != ExperimentStatus.RUNNING:
+            self.logger.error("Experiment not running", experiment_id=experiment_id)
+            return False
+        
+        experiment.status = ExperimentStatus.PAUSED
+        
+        self.logger.info("Experiment stopped", experiment_id=experiment_id)
+        
+        return True
+    
+    async def get_experiment_results(self, experiment_id: str) -> Optional[Dict[str, Any]]:
+        """Get results for an A/B experiment.
+        
+        Args:
+            experiment_id: Experiment ID
+            
+        Returns:
+            Experiment results or None if not found
+        """
+        # Check active experiments
+        experiment = self.active_experiments.get(experiment_id)
+        
+        # Check experiment history if not active
+        if not experiment:
+            for hist_exp in self.experiment_history:
+                if hist_exp.experiment_id == experiment_id:
+                    experiment = hist_exp
+                    break
+        
+        if not experiment:
+            return None
+        
+        # Calculate statistical significance if experiment is completed
+        statistical_significance = None
+        if experiment.status == ExperimentStatus.COMPLETED:
+            statistical_significance = await self._calculate_statistical_significance(experiment)
+        
+        return {
+            "experiment_id": experiment_id,
+            "name": experiment.name,
+            "description": experiment.description,
+            "status": experiment.status.value,
+            "start_time": experiment.start_time.isoformat() if experiment.start_time else None,
+            "end_time": experiment.end_time.isoformat() if experiment.end_time else None,
+            "traffic_split": experiment.traffic_split,
+            "control_config": experiment.control_config,
+            "treatment_config": experiment.treatment_config,
+            "control_metrics": experiment.control_metrics,
+            "treatment_metrics": experiment.treatment_metrics,
+            "user_assignments": len(experiment.user_assignments),
+            "statistical_significance": statistical_significance
+        }
+    
+    async def _calculate_statistical_significance(self, experiment: ABTestExperiment) -> Dict[str, Any]:
+        """Calculate statistical significance for experiment results.
+        
+        Args:
+            experiment: Experiment to analyze
+            
+        Returns:
+            Statistical significance results
+        """
+        try:
+            # Get engagement rates for both groups
+            control_rate = experiment.control_metrics.get("engagement_rate", 0.0)
+            treatment_rate = experiment.treatment_metrics.get("engagement_rate", 0.0)
+            
+            # Count users in each group
+            control_users = sum(1 for group in experiment.user_assignments.values() if group == "control")
+            treatment_users = sum(1 for group in experiment.user_assignments.values() if group == "treatment")
+            
+            if control_users == 0 or treatment_users == 0:
+                return {"error": "Insufficient data for statistical analysis"}
+            
+            # Simple statistical test (in practice, would use proper statistical libraries)
+            # This is a simplified implementation for demonstration
+            pooled_rate = (control_rate * control_users + treatment_rate * treatment_users) / (control_users + treatment_users)
+            pooled_variance = pooled_rate * (1 - pooled_rate)
+            
+            if pooled_variance == 0:
+                return {"error": "No variance in data"}
+            
+            standard_error = (pooled_variance * (1/control_users + 1/treatment_users)) ** 0.5
+            
+            if standard_error == 0:
+                return {"error": "Zero standard error"}
+            
+            z_score = (treatment_rate - control_rate) / standard_error
+            
+            # Approximate p-value calculation (simplified)
+            import math
+            p_value = 2 * (1 - 0.5 * (1 + math.erf(abs(z_score) / math.sqrt(2))))
+            
+            return {
+                "control_rate": control_rate,
+                "treatment_rate": treatment_rate,
+                "difference": treatment_rate - control_rate,
+                "relative_change": ((treatment_rate - control_rate) / control_rate * 100) if control_rate > 0 else 0,
+                "z_score": z_score,
+                "p_value": p_value,
+                "significant": p_value < 0.05,
+                "control_sample_size": control_users,
+                "treatment_sample_size": treatment_users
+            }
+            
+        except Exception as e:
+            self.logger.error("Error calculating statistical significance", error=str(e))
+            return {"error": f"Statistical calculation failed: {str(e)}"}
+    
+    async def get_platform_metrics(self) -> Dict[str, Any]:
+        """Get current platform metrics.
+        
+        Returns:
+            Dictionary of platform metrics
+        """
+        return {
+            **self.metrics,
+            "active_users": len(self.user_registry),
+            "total_content": len(self.content_registry),
+            "active_content": sum(1 for content in self.content_registry.values() if content.is_active),
+            "viral_content_count": len(self.viral_content),
+            "trending_content_count": len(self.trending_content),
+            "active_experiments": len(self.active_experiments),
+            "completed_experiments": len(self.experiment_history),
+            "user_feeds_generated": len(self.user_feeds)
+        }
+    
+    async def update_ranking_configuration(
+        self,
+        ranking_mode: Optional[FeedRankingMode] = None,
+        engagement_weight: Optional[float] = None,
+        safety_weight: Optional[float] = None,
+        personalization_strength: Optional[float] = None
+    ) -> None:
+        """Update feed ranking configuration.
+        
+        Args:
+            ranking_mode: New ranking mode
+            engagement_weight: New engagement weight
+            safety_weight: New safety weight
+            personalization_strength: New personalization strength
+        """
+        if ranking_mode:
+            self.ranking_mode = ranking_mode
+        if engagement_weight is not None:
+            self.engagement_weight = engagement_weight
+        if safety_weight is not None:
+            self.safety_weight = safety_weight
+        if personalization_strength is not None:
+            self.personalization_strength = personalization_strength
+        
+        # Ensure weights sum to 1.0
+        if engagement_weight is not None or safety_weight is not None:
+            total_weight = self.engagement_weight + self.safety_weight
+            if total_weight > 0:
+                self.engagement_weight /= total_weight
+                self.safety_weight /= total_weight
+        
+        self.logger.info(
+            "Ranking configuration updated",
+            ranking_mode=self.ranking_mode.value,
+            engagement_weight=self.engagement_weight,
+            safety_weight=self.safety_weight
+        ):
             user_id: User ID
             limit: Maximum number of items to return
             
